@@ -1,0 +1,56 @@
+name: Build ArchForge Offline ISO
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'profile/**'
+      - 'packages/**'
+      - 'installer/**'
+      - 'scripts/**'
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # A full offline repo can be large. Increase runner disk or use self-hosted
+    # hardware if GitHub-hosted runner space is insufficient.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build in privileged Arch container
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          docker pull archlinux:latest
+          docker run --privileged --rm \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace \
+            archlinux:latest \
+            bash -euxc '
+              pacman -Syu --noconfirm
+              pacman -S --needed --noconfirm archiso git squashfs-tools dosfstools \
+                mtools grub libisoburn rsync
+              bash scripts/build.sh
+            '
+
+      - name: Generate checksums
+        run: |
+          cd out
+          sha256sum *.iso > SHA256SUMS
+
+      - name: Upload ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: archforge-offline-${{ github.run_number }}
+          path: |
+            out/*.iso
+            out/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
