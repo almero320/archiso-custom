@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+trap '
+    rc=$?
+    echo
+    echo "========== ARCHFORGE BUILD FAILURE =========="
+    echo "Exit code : $rc"
+    echo "Line      : ${BASH_LINENO[0]}"
+    echo "Command   : ${BASH_COMMAND}"
+    echo "============================================="
+    exit "$rc"
+' ERR
+
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$ROOT/out"
 WORK="$ROOT/work"
@@ -19,7 +30,15 @@ cp -a "$ARCHISO_PROFILE" "$PROFILE"
 
 # Keep the live ISO lean: it contains the installer and tools, not the entire
 # target workstation package set. The target dependency closure goes in repo/.
-cp "$ROOT/profile/packages.x86_64" "$PROFILE/packages.x86_64"
+# Preserve mandatory Archiso releng packages.
+# Add ArchForge live packages without removing the base profile.
+{
+    cat "$PROFILE/packages.x86_64"
+    cat "$ROOT/profile/packages.x86_64"
+} | sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d' | sort -u \
+  > "$WORK/packages.x86_64"
+
+install -m644 "$WORK/packages.x86_64" "$PROFILE/packages.x86_64"
 mkdir -p "$REPO"
 
 mapfile -t TARGET_PKGS < <(grep -Ev '^[[:space:]]*(#|$)' "$ROOT/packages/target.txt" | sort -u)
@@ -39,13 +58,18 @@ repo-add "$REPO/archforge.db.tar.gz" "$REPO"/*.pkg.tar.zst
 
 # Archiso's stock releng boot entries refer to the stock kernel filename.
 # Rewrite those references to the Zen kernel shipped in this profile.
-grep -RIl 'vmlinuz-linux\|initramfs-linux' "$PROFILE" --exclude='*.zst' 2>/dev/null | \
-  while read -r cfg; do
-    sed -i \
-      -e 's/initramfs-linux-fallback\.img/initramfs-linux-zen-fallback.img/g' \
-      -e 's/initramfs-linux\.img/initramfs-linux-zen.img/g' \
-      -e 's/vmlinuz-linux/vmlinuz-linux-zen/g' "$cfg"
-  done
+# Rewrite only text configuration files.
+while IFS= read -r -d '' cfg; do
+    if grep -IqE 'vmlinuz-linux|initramfs-linux' "$cfg"; then
+        echo "Updating kernel references: $cfg"
+
+        sed -i \
+          -e 's/initramfs-linux-fallback\.img/initramfs-linux-zen-fallback.img/g' \
+          -e 's/initramfs-linux\.img/initramfs-linux-zen.img/g' \
+          -e 's/vmlinuz-linux/vmlinuz-linux-zen/g' \
+          "$cfg"
+    fi
+done < <(find "$PROFILE" -type f -print0)
 
 # Install installer and repository configuration into the live root.
 install -Dm755 "$ROOT/installer/archforge-install" \
