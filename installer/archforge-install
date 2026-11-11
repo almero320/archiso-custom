@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+REPO="/opt/archforge/repo"
+PACCONF="/etc/archforge-target-pacman.conf"
+LOG="/tmp/archforge-install.log"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+need_root() { [[ $EUID -eq 0 ]] || die "Run as root: archforge-install"; }
+
+need_root
+[[ -d "$REPO" ]] || die "Offline repository not found at $REPO. Boot from the ArchForge ISO."
+command -v dialog >/dev/null || die "dialog is missing."
+command -v pacstrap >/dev/null || die "arch-install-scripts is missing."
+
+clear
+cat <<'BANNER'
+   _             _     _____
+  /_\  _ __ ___| |__ |  ___|__  _ __ __ _  ___
+ //_\\| '__/ __| '_ \| |_ / _ \| '__/ _` |/ _ \
+/  _  \ | | (__| | | |  _| (_) | | | (_| |  __/
+\_/ \_/_|  \___|_| |_|_|  \___/|_|  \__, |\___|
+                                    |___/
+       OFFLINE ZEN WORKSTATION INSTALLER
+BANNER
+
+echo
+echo "WARNING: The selected disk will be erased completely."
+echo
+mapfile -t DISKS < <(lsblk -dpno NAME,SIZE,MODEL,TYPE | awk '$4=="disk" {print $1 " | " $2 " | " $3}')
+((${#DISKS[@]})) || die "No disks detected."
+
+MENU_ARGS=()
+for i in "${!DISKS[@]}"; do
+  MENU_ARGS+=("$((i+1))" "${DISKS[$i]}")
+done
+DISK="$(dialog --stdout --title "Target disk" --menu "Choose the disk to ERASE:" 18 75 10 "${MENU_ARGS[@]}")" || exit 0
+[[ -n "$DISK" ]] || exit 0
+SELECTED="${DISKS[$((DISK-1))]}"
+TARGET="${SELECTED%% |*}"
+[[ -b "$TARGET" ]] || die "Invalid target disk."
+
+MODE="$(dialog --stdout --title "Boot mode" --menu "Select partition layout:" 12 65 4 \
+  uefi "UEFI (GPT + EFI System Partition)" \
+  bios "Legacy BIOS (GPT + BIOS boot partition)")" || exit 0
+
+HOST="$(dialog --stdout --title "Hostname" --inputbox "Hostname:" 8 50 archforge)" || exit 0
+USER_NAME="$(dialog --stdout --title "User" --inputbox "Create a regular username:" 8 50 user)" || exit 0
+[[ "$USER_NAME" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || die "Invalid username."
+ZONE="$(dialog --stdout --title "Timezone" --inputbox "Timezone (example: Asia/Jakarta):" 8 55 Asia/Jakarta)" || exit 0
+ROOT_PASS="$(dialog --stdout --insecure --title "Root password" --passwordbox "Set root password:" 8 55)" || exit 0
+USER_PASS="$(dialog --stdout --insecure --title "User password" --passwordbox "Set password for $USER_NAME:" 8 55)" || exit 0
+[[ -n "$ROOT_PASS" && -n "$USER_PASS" ]] || die "Passwords cannot be empty."
+
+dialog --title "FINAL CONFIRMATION" --yesno \
+  "ALL DATA ON $TARGET WILL BE DESTROYED.\n\nInstall ArchForge Zen to $TARGET?" 12 65 || exit 0
+
+exec > >(tee -a "$LOG") 2>&1
+echo "Installing to $TARGET"
+
+# Unmount any automounted partitions before repartitioning.
+while read -r part; do umount "$part" 2>/dev/null || true; done < <(lsblk -lnpo NAME "$TARGET" | tail -n +2)
+
+sgdisk --zap-all "$TARGET"
+if [[ "$MODE" == "uefi" ]]; then
+  sgdisk -n 1:0:+1G -t 1:ef00 -c 1:EFI "$TARGET"
+  sgdisk -n 2:0:0 -t 2:8300 -c 2:ARCHROOT "$TARGET"
+  partprobe "$TARGET"
+  sleep 2
+  if [[ "$TARGET" =~ (nvme|mmcblk|loop) ]]; then EFI="${TARGET}p1"; ROOT="${TARGET}p2"; else EFI="${TARGET}1"; ROOT="${TARGET}2"; fi
+  mkfs.fat -F32 "$EFI"
+else
+  sgdisk -n 1:0:+2M -t 1:ef02 -c 1:BIOSBOOT "$TARGET"
+  sgdisk -n 2:0:0 -t 2:8300 -c 2:ARCHROOT "$TARGET"
+  partprobe "$TARGET"
+  sleep 2
+  if [[ "$TARGET" =~ (nvme|mmcblk|loop) ]]; then ROOT="${TARGET}p2"; else ROOT="${TARGET}2"; fi
+  EFI=""
+fi
+
+mkfs.ext4 -F "$ROOT"
+mount "$ROOT" /mnt
+if [[ "$MODE" == "uefi" ]]; then
+  mkdir -p /mnt/boot
+  mount "$EFI" /mnt/boot
+fi
+
+# Use only the ISO's local repository; no network mirrors are required.
+mapfile -t TARGET_PKGS < <(grep -Ev '^[[:space:]]*(#|$)' /usr/share/archforge/target.txt | sort -u)
+pacstrap -C "$PACCONF" -K /mnt "${TARGET_PKGS[@]}"
+
+genfstab -U /mnt >> /mnt/etc/fstab
+arch-chroot /mnt ln -sf "/usr/share/zoneinfo/$ZONE" /etc/localtime
+arch-chroot /mnt hwclock --systohc
+arch-chroot /mnt bash -c "sed -i 's/^#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen"
+arch-chroot /mnt locale-gen
+echo "LANG=en_US.UTF-8" > /mnt/etc/locale.conf
+echo "$HOST" > /mnt/etc/hostname
+cat > /mnt/etc/hosts <<EOF
+127.0.0.1 localhost
+::1 localhost
+127.0.1.1 $HOST.localdomain $HOST
+EOF
+
+arch-chroot /mnt useradd -m -G wheel,audio,video,storage,optical -s /bin/bash "$USER_NAME"
+printf 'root:%s\n%s:%s\n' "$ROOT_PASS" "$USER_NAME" "$USER_PASS" | arch-chroot /mnt chpasswd
+echo '%wheel ALL=(ALL:ALL) ALL' > /mnt/etc/sudoers.d/10-wheel
+chmod 440 /mnt/etc/sudoers.d/10-wheel
+
+arch-chroot /mnt systemctl enable NetworkManager
+arch-chroot /mnt systemctl enable bluetooth
+arch-chroot /mnt systemctl enable fstrim.timer
+arch-chroot /mnt systemctl enable systemd-timesyncd
+
+# PulseAudio is started per-user, not as a system service.
+if [[ "$MODE" == "uefi" ]]; then
+  arch-chroot /mnt grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=ArchForge
+else
+  arch-chroot /mnt grub-install --target=i386-pc "$TARGET"
+fi
+arch-chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg
+
+# Remove any temporary repository configuration from the installed system.
+rm -f /mnt/etc/archforge-target-pacman.conf
+umount -R /mnt
+dialog --title "Installation complete" --msgbox \
+  "ArchForge has been installed. Remove the USB and reboot.\n\nInstall log: $LOG" 10 65

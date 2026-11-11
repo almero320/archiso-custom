@@ -1,0 +1,20 @@
+# Lean live environment. Target packages are stored in the embedded offline repo.
+base
+linux-zen
+linux-zen-headers
+linux-firmware
+arch-install-scripts
+pacman
+sudo
+dialog
+parted
+gptfdisk
+dosfstools
+e2fsprogs
+btrfs-progs
+xfsprogs
+grub
+efibootmgr
+networkmanager
+pciutils
+usbutils
