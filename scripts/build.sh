@@ -23,29 +23,35 @@ ARCHISO_PROFILE="/usr/share/archiso/configs/releng"
 [[ $EUID -eq 0 ]] || { echo "Run as root." >&2; exit 1; }
 command -v mkarchiso >/dev/null || { echo "Install archiso first." >&2; exit 1; }
 [[ -d "$ARCHISO_PROFILE" ]] || { echo "Missing Archiso releng profile." >&2; exit 1; }
+[[ -f "$ROOT/installer/archforge-install" ]] || { echo "Missing installer/archforge-install." >&2; exit 1; }
+[[ -f "$ROOT/packages/target.txt" ]] || { echo "Missing packages/target.txt." >&2; exit 1; }
 
 rm -rf "$WORK"
 mkdir -p "$OUT" "$WORK"
 cp -a "$ARCHISO_PROFILE" "$PROFILE"
 
-# Keep the live ISO lean: it contains the installer and tools, not the entire
-# target workstation package set. The target dependency closure goes in repo/.
-# Preserve mandatory Archiso releng packages.
-# Add ArchForge live packages without removing the base profile.
+# Keep the live ISO lean, but include the tools required by the interactive installer.
+# Preserve all mandatory Archiso releng packages.
 {
     cat "$PROFILE/packages.x86_64"
     cat "$ROOT/profile/packages.x86_64"
+    printf '%s\n' \
+        dialog \
+        gptfdisk \
+        dosfstools \
+        e2fsprogs \
+        parted \
+        arch-install-scripts
 } | sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d' | sort -u \
   > "$WORK/packages.x86_64"
 
 install -m644 "$WORK/packages.x86_64" "$PROFILE/packages.x86_64"
 mkdir -p "$REPO"
 
-mapfile -t TARGET_PKGS < <(grep -Ev '^[[:space:]]*(#|$)' "$ROOT/packages/target.txt" | sort -u)
+mapfile -t TARGET_PKGS < <(grep -Ev '^[[:space:]]*(#|$)' "$ROOT/packages/target.txt" | sed -E 's/[[:space:]]+#.*$//' | awk 'NF' | sort -u)
+((${#TARGET_PKGS[@]} > 0)) || { echo "Target package list is empty." >&2; exit 1; }
 printf 'Resolving and downloading %s requested package roots...\n' "${#TARGET_PKGS[@]}"
 
-# pacman resolves dependencies and downloads the complete dependency closure.
-# --cachedir points directly at the embedded repository directory.
 # Resolve against an empty package database so dependencies already installed
 # in the build container are still downloaded into the offline repository.
 mkdir -p "$WORK/repo-root" "$WORK/repo-db"
@@ -53,16 +59,16 @@ pacman -Sy --noconfirm --root "$WORK/repo-root" --dbpath "$WORK/repo-db"
 pacman -Sw --noconfirm --root "$WORK/repo-root" --dbpath "$WORK/repo-db" \
   --cachedir "$REPO" "${TARGET_PKGS[@]}"
 
-# Create a local pacman repository database.
-repo-add "$REPO/archforge.db.tar.gz" "$REPO"/*.pkg.tar.zst
+# Build the repository database from every downloaded package archive.
+shopt -s nullglob
+PKG_FILES=("$REPO"/*.pkg.tar.zst)
+((${#PKG_FILES[@]} > 0)) || { echo "No package archives were downloaded into $REPO." >&2; exit 1; }
+repo-add "$REPO/archforge.db.tar.gz" "${PKG_FILES[@]}"
 
-# Archiso's stock releng boot entries refer to the stock kernel filename.
-# Rewrite those references to the Zen kernel shipped in this profile.
-# Rewrite only text configuration files.
+# Rewrite Archiso boot entries to use the Zen kernel shipped in the live profile.
 while IFS= read -r -d '' cfg; do
     if grep -IqE 'vmlinuz-linux|initramfs-linux' "$cfg"; then
         echo "Updating kernel references: $cfg"
-
         sed -i \
           -e 's/initramfs-linux-fallback\.img/initramfs-linux-zen-fallback.img/g' \
           -e 's/initramfs-linux\.img/initramfs-linux-zen.img/g' \
@@ -71,9 +77,16 @@ while IFS= read -r -d '' cfg; do
     fi
 done < <(find "$PROFILE" -type f -print0)
 
-# Install installer and repository configuration into the live root.
+# Install the offline repository and installer into the live root.
+install -d "$PROFILE/airootfs/usr/local/bin"
 install -Dm755 "$ROOT/installer/archforge-install" \
   "$PROFILE/airootfs/usr/local/bin/archforge-install"
+chmod 0755 "$PROFILE/airootfs/usr/local/bin/archforge-install"
+[[ -x "$PROFILE/airootfs/usr/local/bin/archforge-install" ]] || {
+    echo "Installer is not executable in the Archiso profile." >&2
+    exit 1
+}
+
 install -Dm644 "$ROOT/installer/archforge-live-pacman.conf" \
   "$PROFILE/airootfs/etc/archforge-live-pacman.conf"
 install -Dm644 "$ROOT/installer/archforge-target-pacman.conf" \
@@ -83,7 +96,10 @@ install -Dm644 "$ROOT/README.md" \
 install -Dm644 "$ROOT/packages/target.txt" \
   "$PROFILE/airootfs/usr/share/archforge/target.txt"
 
-# Make the live environment boot to a root TTY; no graphical login.
+# Make the command available directly as: archforge-install
+# /usr/local/bin is already on the standard Arch root PATH.
+
+# Boot the live environment into a root TTY; no graphical login.
 mkdir -p "$PROFILE/airootfs/etc/systemd/system"
 ln -sf /usr/lib/systemd/system/multi-user.target \
   "$PROFILE/airootfs/etc/systemd/system/default.target"
